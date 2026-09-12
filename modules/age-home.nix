@@ -11,21 +11,55 @@ let
 
   ageBin = lib.getExe config.age.package;
 
+  mapListOrAttrs = f: x: if builtins.isList x then map f x else lib.mapAttrs (_: f) x;
+  mapListOrAttrsToList = f: x: if builtins.isList x then map f x else lib.mapAttrsToList (_: f) x;
+
+  secretsMountPoint = "/secrets";
+  templatesMountPoint = "/templates";
+
   newGeneration = ''
-    _agenix_generation="$(basename "$(readlink "${cfg.secretsDir}")" || echo 0)"
-    (( ++_agenix_generation ))
-    echo "[agenix] creating new generation in ${cfg.secretsMountPoint}/$_agenix_generation"
-    mkdir -p "${cfg.secretsMountPoint}"
-    chmod 0751 "${cfg.secretsMountPoint}"
-    mkdir -p "${cfg.secretsMountPoint}/$_agenix_generation"
-    chmod 0751 "${cfg.secretsMountPoint}/$_agenix_generation"
+        _agenix_generation="$(basename "$(dirname "$(readlink "${cfg.secretsDir}")")" || echo 0)"
+    	if ! [[ "$_agenix_generation" =~ ^[0-9]+$ ]]
+        then
+    	  _agenix_generation=0
+    fi
+        (( ++_agenix_generation ))
+        echo "[agenix] creating new generation in ${cfg.ageMountPoint}/$_agenix_generation"
+        mkdir -p "${cfg.ageMountPoint}"
+        chmod 0751 "${cfg.ageMountPoint}"
+        mkdir -p "${cfg.ageMountPoint}/$_agenix_generation"
+        chmod 0751 "${cfg.ageMountPoint}/$_agenix_generation"
+        mkdir -p "${cfg.ageMountPoint}/$_agenix_generation${secretsMountPoint}"
+        mkdir -p "${cfg.ageMountPoint}/$_agenix_generation${templatesMountPoint}"
   '';
+
+  # The agenix managed directory a secret or template is exposed through, and
+  # the mount point of that directory inside a generation.
+  targetDir =
+    secretType: toString (if secretType.type == "template" then cfg.templateDir else cfg.secretsDir);
+  mountPoint =
+    secretType: if secretType.type == "template" then templatesMountPoint else secretsMountPoint;
+
+  # Whether path points inside the agenix managed directory. That directory is
+  # itself a symlink which only points at the new generation once everything is
+  # installed, so such files cannot be written to path directly: they would land
+  # in the previous generation and be removed together with it. They are created
+  # in the new generation instead, keeping any nested folders of path.
+  inTargetDir = secretType: hasPrefix "${targetDir secretType}/" secretType.path;
+
+  # Location of the file inside a generation, relative to its mount point.
+  generationPath =
+    secretType:
+    if inTargetDir secretType then
+      removePrefix "${targetDir secretType}/" secretType.path
+    else
+      secretType.name;
 
   setTruePath = secretType: ''
     ${
-      if secretType.symlink then
+      if secretType.symlink || inTargetDir secretType then
         ''
-          _truePath="${cfg.secretsMountPoint}/$_agenix_generation/${secretType.name}"
+          _truePath="${cfg.ageMountPoint}/$_agenix_generation${mountPoint secretType}/${generationPath secretType}"
         ''
       else
         ''
@@ -34,15 +68,23 @@ let
     }
   '';
 
-  installSecret = secretType: ''
-    ${setTruePath secretType}
-    echo "decrypting '${secretType.file}' to '$_truePath'..."
-    TMP_FILE="$_truePath.tmp"
+  # Files outside of the managed directory are symlinked into place. Files
+  # inside it are already reachable through the directory symlink itself.
+  linkToPath =
+    secretType:
+    optionalString (secretType.symlink && !inTargetDir secretType) ''
+      mkdir -p "$(dirname "${secretType.path}")"
+      ln -sfT "${targetDir secretType}/${secretType.name}" "${secretType.path}"
+    '';
 
+  setupStart = secretType: ''
+    ${setTruePath secretType}
+    echo "setting up ${secretType.type} '${secretType.name}' at '$_truePath'..."
+    TMP_FILE="$_truePath.tmp"
     IDENTITIES=()
-    # shellcheck disable=2043
     for identity in ${toString cfg.identityPaths}; do
       test -r "$identity" || continue
+      test -s "$identity" || continue
       IDENTITIES+=(-i)
       IDENTITIES+=("$identity")
     done
@@ -50,8 +92,52 @@ let
     test "''${#IDENTITIES[@]}" -eq 0 && echo "[agenix] WARNING: no readable identities found!"
 
     mkdir -p "$(dirname "$_truePath")"
-    # shellcheck disable=SC2193,SC2050
-    [ "${secretType.path}" != "${cfg.secretsDir}/${secretType.name}" ] && mkdir -p "$(dirname "${secretType.path}")"
+
+  '';
+
+  installTemplate = templateType: ''
+        ${setupStart templateType}
+        echo "generating template '${templateType.name}' to '$_truePath'..."
+        cp ${templateType.file} "$TMP_FILE"
+
+        ${builtins.concatStringsSep "\n" (
+          lib.flip mapListOrAttrsToList templateType.placeholderMap (dep: ''
+            echo "replacing placeholder ${dep.placeholder} in ${templateType.name}..."
+            test -f "${dep.file}" || echo "[agenix] WARNING: dependency file ${dep.file} does not exist!"
+
+            _secret=$(${ageBin} --decrypt "''${IDENTITIES[@]}" ${lib.escapeShellArg dep.file})
+            _secret="''${_secret//\\/\\\\}"
+            _secret="''${_secret//|/\\|}"
+            _secret="''${_secret//&/\\&}"
+            _secret="''${_secret//$'\n'/\\n}"
+            sed -i.bak "s|${dep.placeholder}|''${_secret}|g" "$TMP_FILE"
+            rm -f "$TMP_FILE.bak"
+          '')
+        )}
+        # check if the template changed then add units
+        if [ -f "$_truePath" ]; then
+          if cmp -s "$_truePath" "$TMP_FILE"; then
+            :
+          else
+            echo "template ${templateType.name} changed."
+            ${concatStringsSep "\n" (
+              map (unit: "UNITS_TO_RESTART+=('${unit}')") templateType.restartUnits
+            )}
+          fi
+        else
+            echo "template ${templateType.name} is new."
+            ${concatStringsSep "\n" (
+              map (unit: "UNITS_TO_RESTART+=('${unit}')") templateType.restartUnits
+            )}
+        fi
+
+        chmod ${templateType.mode} "$TMP_FILE"
+        mv -f "$TMP_FILE" "$_truePath"
+    ${linkToPath templateType}
+  '';
+
+  installSecret = secretType: ''
+    ${setupStart secretType}
     (
       umask u=r,g=,o=
       test -f "${secretType.file}" || echo '[agenix] WARNING: encrypted file ${secretType.file} does not exist!'
@@ -60,13 +146,21 @@ let
         config.i18n.defaultLocale or "C"
       } ${ageBin} --decrypt "''${IDENTITIES[@]}" -o "$TMP_FILE" "${secretType.file}"
     )
+    if [ -f "$_truePath" ]; then
+      if cmp -s "$_truePath" "$TMP_FILE"; then
+        :
+      else
+        echo "${secretType.name} changed."
+        ${concatStringsSep "\n" (map (unit: "UNITS_TO_RESTART+=('${unit}')") secretType.restartUnits)}
+      fi
+    else
+        echo "${secretType.name} is new."
+        ${concatStringsSep "\n" (map (unit: "UNITS_TO_RESTART+=('${unit}')") secretType.restartUnits)}
+    fi
     chmod ${secretType.mode} "$TMP_FILE"
     mv -f "$TMP_FILE" "$_truePath"
 
-    ${optionalString secretType.symlink ''
-      # shellcheck disable=SC2193,SC2050
-      [ "${secretType.path}" != "${cfg.secretsDir}/${secretType.name}" ] && ln -sfT "${cfg.secretsDir}/${secretType.name}" "${secretType.path}"
-    ''}
+    ${linkToPath secretType}
   '';
 
   testIdentities = map (path: ''
@@ -74,22 +168,139 @@ let
   '') cfg.identityPaths;
 
   cleanupAndLink = ''
-    _agenix_generation="$(basename "$(readlink "${cfg.secretsDir}")" || echo 0)"
-    (( ++_agenix_generation ))
-    echo "[agenix] symlinking new secrets to ${cfg.secretsDir} (generation $_agenix_generation)..."
-    ln -sfT "${cfg.secretsMountPoint}/$_agenix_generation" "${cfg.secretsDir}"
+        _agenix_generation="$(basename "$(dirname "$(readlink "${cfg.secretsDir}")")" || echo 0)"
+    	if ! [[ "$_agenix_generation" =~ ^[0-9]+$ ]]
+        then
+    	  _agenix_generation=0
+    fi
 
-    (( _agenix_generation > 1 )) && {
-    echo "[agenix] removing old secrets (generation $(( _agenix_generation - 1 )))..."
-    rm -rf "${cfg.secretsMountPoint}/$(( _agenix_generation - 1 ))"
-    }
+        (( ++_agenix_generation ))
+        echo "[agenix] symlinking new secrets to ${cfg.secretsDir} (generation $_agenix_generation)..."
+         # Ensure parent dir exists (e.g. .../agenix if targets are .../agenix/secrets)
+        [[ -d "$(dirname "${cfg.secretsDir}")" ]] || mkdir -p "$(dirname "${cfg.secretsDir}")"
+        [[ -d "$(dirname "${cfg.templateDir}")" ]] || mkdir -p "$(dirname "${cfg.templateDir}")"
+
+        ln -sfT "${cfg.ageMountPoint}/$_agenix_generation${secretsMountPoint}" "${cfg.secretsDir}"
+
+        echo "[agenix] symlinking new templates to ${cfg.templateDir} (generation $_agenix_generation)..."
+        ln -sfT "${cfg.ageMountPoint}/$_agenix_generation${templatesMountPoint}" "${cfg.templateDir}"
+
+        (( _agenix_generation > 1 )) && {
+        echo "[agenix] removing old secrets (generation $(( _agenix_generation - 1 )))..."
+        rm -rf "${cfg.ageMountPoint}/$(( _agenix_generation - 1 ))"
+        }
   '';
 
   installSecrets = builtins.concatStringsSep "\n" (
-    [ "echo '[agenix] decrypting secrets...'" ]
+    [
+      "echo '[agenix] decrypting secrets...'"
+      "UNITS_TO_RESTART=()"
+    ]
     ++ testIdentities
     ++ (map installSecret (builtins.attrValues cfg.secrets))
-    ++ [ cleanupAndLink ]
+    ++ (map installTemplate (builtins.attrValues cfg.templates))
+    ++ [
+      cleanupAndLink
+      ''
+        if [ "''${#UNITS_TO_RESTART[@]}" -ne 0 ]; then
+          mapfile -t UNIQUE_UNITS < <(printf "%s\n" "''${UNITS_TO_RESTART[@]}" | sort -u)
+          echo "[agenix] restarting units: ''${UNIQUE_UNITS[*]}"
+          if [ "$(uname)" = "Darwin" ]; then
+             for unit in "''${UNIQUE_UNITS[@]}"; do
+               launchctl kickstart -k "gui/$(id -u)/$unit" || true
+             done
+          else
+             systemctl --user try-restart "''${UNIQUE_UNITS[@]}"
+          fi
+        fi
+      ''
+    ]
+  );
+
+  templateType = types.submodule (
+    { config, ... }:
+    {
+      options = {
+        name = mkOption {
+          type = types.str;
+          default = config._module.args.name;
+          description = "The name of this secret.";
+        };
+        dependencies = mkOption {
+          type =
+            with types;
+            oneOf [
+              (listOf unspecified)
+              (attrsOf unspecified)
+            ];
+          default = [ ];
+          description = ''
+            Other secrets on which this template depends.
+          '';
+        };
+        restartUnits = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          description = ''
+            List of units to restart when this template is updated.
+          '';
+        };
+        type = mkOption {
+          type = types.enum [ "template" ];
+          readOnly = true;
+          internal = true;
+          default = "template";
+        };
+
+        content = mkOption {
+          type = types.functionTo (types.str);
+        };
+        mode = mkOption {
+          type = types.str;
+          default = "0400";
+        };
+        path = mkOption {
+          type = types.str;
+          default = "${cfg.templateDir}/${config.name}";
+          description = "The path where the generated file will be written to.";
+        };
+        placeholderMap = mkOption {
+          type = types.attrsOf types.attrs;
+          default = mapListOrAttrs (
+            dep:
+            dep
+            // {
+              placeholder = "<AGE_PLACEHOLDER:${builtins.hashString "sha256" dep.name}:${builtins.hashString "sha256" (toString dep.file)}:>";
+            }
+          ) config.dependencies;
+          internal = true;
+          readOnly = true;
+          description = ''
+            Placeholders to be used in the content script.
+          '';
+        };
+        file = mkOption {
+          type = types.path;
+          internal = true;
+          readOnly = true;
+          default = "${pkgs.writeTextFile {
+            name = "agenix-template-${config.name}-content";
+            text = config.content {
+              pkgs = pkgs;
+              lib = lib;
+              placeholders = mapListOrAttrs (dep: dep.placeholder) config.placeholderMap;
+              deps = mapListOrAttrsToList (dep: dep.path) config.dependencies;
+            };
+          }}";
+          description = "The path where the generated file will be written to.";
+        };
+        symlink = mkEnableOption "symlinking templates to their destination" // {
+          default = true;
+        };
+
+      };
+
+    }
   );
 
   secretType = types.submodule (
@@ -106,6 +317,12 @@ let
           description = ''
             Name of the file used in ''${cfg.secretsDir}
           '';
+        };
+        type = mkOption {
+          type = types.enum [ "secret" ];
+          readOnly = true;
+          internal = true;
+          default = "secret";
         };
         file = mkOption {
           type = types.path;
@@ -127,6 +344,13 @@ let
             Permissions mode of the decrypted secret in a format understood by chmod.
           '';
         };
+        restartUnits = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          description = ''
+            List of units to restart when this secret is updated.
+          '';
+        };
         symlink = mkEnableOption "symlinking secrets to their destination" // {
           default = true;
         };
@@ -138,7 +362,14 @@ let
     let
       app = pkgs.writeShellApplication {
         name = "agenix-home-manager-mount-secrets";
-        runtimeInputs = with pkgs; [ coreutils ];
+        runtimeInputs =
+          with pkgs;
+          [
+            coreutils
+            diffutils
+            gnused
+          ]
+          ++ lib.optionals stdenv.isLinux [ systemd ];
         text = ''
           ${newGeneration}
           ${installSecrets}
@@ -175,6 +406,14 @@ in
       '';
     };
 
+    templates = mkOption {
+      type = types.attrsOf templateType;
+      default = { };
+      description = ''
+        Attrset of templates.
+      '';
+    };
+
     identityPaths = mkOption {
       type = types.listOf types.path;
       default = [
@@ -194,23 +433,32 @@ in
 
     secretsDir = mkOption {
       type = types.str;
-      default = userDirectory "agenix";
-      defaultText = userDirectoryDescription "agenix";
+      default = userDirectory "agenix/secrets";
+      defaultText = userDirectoryDescription "agenix/secrets";
       description = ''
         Folder where secrets are symlinked to
       '';
     };
 
-    secretsMountPoint = mkOption {
+    templateDir = mkOption {
+      type = types.str;
+      default = userDirectory "agenix/templates";
+      defaultText = userDirectoryDescription "agenix/templates";
+      description = ''
+        Folder where templates are symlinked to.
+      '';
+    };
+
+    ageMountPoint = mkOption {
       default = userDirectory "agenix.d";
       defaultText = userDirectoryDescription "agenix.d";
       description = ''
-        Where secrets are created before they are symlinked to ''${cfg.secretsDir}
+        Where secrets are created before they are symlinked to ''${cfg.secretsDir} and templates to ''${cfg.templateDir}.
       '';
     };
   };
 
-  config = mkIf (cfg.secrets != { }) {
+  config = mkIf (cfg.secrets != { } || cfg.templates != { }) {
     assertions = [
       {
         assertion = cfg.identityPaths != [ ];
