@@ -559,6 +559,12 @@ stop using them.
 Some programs do not like following symlinks (for example Java
 programs like Elasticsearch).
 
+If `age.secrets.<name>.path` points inside `age.secretsDir`, the secret
+is created in the generation directory that `age.secretsDir` links to,
+keeping any nested folders of the path. It is still a regular file (not
+a symlink) at that path, but it is cleaned up with its generation like
+any other secret.
+
 Example:
 
 ```nix
@@ -677,6 +683,10 @@ in a format understood by chmod.
 `age.secrets.<name>.symlink` is a boolean. If true (the default),
 secrets are symlinked to `age.secrets.<name>.path`. If false, secrets
 are copied to `age.secrets.<name>.path`.
+
+If `age.secrets.<name>.path` points inside `age.secretsDir`, the secret
+is created in the generation directory that `age.secretsDir` links to,
+keeping any nested folders of the path.
 
 #### `age.identityPaths`
 
