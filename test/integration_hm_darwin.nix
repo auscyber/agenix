@@ -11,6 +11,12 @@
   age = {
     identityPaths = options.age.identityPaths.default ++ [ "/Users/user1/.ssh/this_key_wont_exist" ];
     secrets.user-secret.file = ../example/secret2.age;
+    # a real file in a nested folder of secretsDir
+    secrets.nested-user-secret = {
+      file = ../example/secret2.age;
+      symlink = false;
+      path = "${config.age.secretsDir}/nested/dir/user-secret";
+    };
   };
 
   home = rec {
@@ -32,6 +38,8 @@
           in
           ''
             diff -q "${config.age.secrets.user-secret.path}" <(printf '${secret}\n')
+            diff -q "${config.age.secrets.nested-user-secret.path}" <(printf '${secret}\n')
+            test ! -L "${config.age.secrets.nested-user-secret.path}"
           '';
       };
     };

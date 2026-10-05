@@ -28,6 +28,12 @@ pkgs.nixosTest {
       age.secrets = {
         passwordfile-user1.file = ../example/passwordfile-user1.age;
         leading-hyphen.file = ../example/-leading-hyphen-filename.age;
+        # a real file in a nested folder of secretsDir
+        nested-hyphen = {
+          file = ../example/-leading-hyphen-filename.age;
+          symlink = false;
+          path = "${config.age.secretsDir}/nested/dir/leading-hyphen";
+        };
       };
 
       age.identityPaths = options.age.identityPaths.default ++ [ "/etc/ssh/this_key_wont_exist" ];
@@ -49,7 +55,7 @@ pkgs.nixosTest {
       };
 
       home-manager.users.user1 =
-        { options, ... }:
+        { config, options, ... }:
         {
           imports = [
             ../modules/age-home.nix
@@ -70,6 +76,12 @@ pkgs.nixosTest {
             secrets.armored-secret = {
               file = ../example/armored-secret.age;
             };
+            # a real file in a nested folder of secretsDir
+            secrets.nested-secret2 = {
+              file = ../example/secret2.age;
+              symlink = false;
+              path = "${config.age.secretsDir}/nested/dir/secret2";
+            };
           };
         };
     };
@@ -81,6 +93,7 @@ pkgs.nixosTest {
       secret2 = "world!";
       hyphen-secret = "filename started with hyphen";
       armored-secret = "Hello World!";
+      nested-secret-path = "/run/agenix/secrets/nested/dir/leading-hyphen";
     in
     ''
       system1.wait_for_unit("multi-user.target")
@@ -106,7 +119,15 @@ pkgs.nixosTest {
       system1.wait_for_file("/tmp/3")
       assert "${armored-secret}" in system1.succeed("cat /tmp/3")
 
+      system1.send_chars("cat /run/user/$(id -u)/agenix/secrets/nested/dir/secret2 > /tmp/4\n")
+      system1.wait_for_file("/tmp/4")
+      assert "${secret2}" in system1.succeed("cat /tmp/4")
+
       assert "${hyphen-secret}" in system1.succeed("cat /run/agenix/leading-hyphen")
+
+      # secrets in a nested folder of secretsDir are real files, not symlinks
+      assert "${hyphen-secret}" in system1.succeed("cat ${nested-secret-path}")
+      system1.fail("test -L ${nested-secret-path}")
 
       userDo = lambda input : f"sudo -u user1 -- bash -c 'set -eou pipefail; cd /tmp/secrets; {input}'"
 
