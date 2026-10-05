@@ -21,6 +21,7 @@
       darwin,
       home-manager,
       systems,
+      ...
     }:
     let
       eachSystem = nixpkgs.lib.genAttrs (import systems);
