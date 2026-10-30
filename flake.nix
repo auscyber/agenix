@@ -9,6 +9,7 @@
     {
       self,
       nixpkgs,
+      ...
     }:
     let
       # nixpkgs cannot bootstrap GHC on these systems. Omit nixfmt-tree and
